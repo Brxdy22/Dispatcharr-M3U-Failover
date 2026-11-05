@@ -757,7 +757,7 @@ def _bench_once(url, creds):
         return {"ok": False, "err": f"{type(e).__name__}: {str(e)[:70]}", "total": time.perf_counter() - t0}
 
 
-SORT_UA = os.environ.get("SORT_USER_AGENT", "TiviMate/5.1.6 (Android 12)")
+SORT_UA = os.environ.get("SORT_USER_AGENT", "m3u-failover")
 
 
 def _rank(urls, results):

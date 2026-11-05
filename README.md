@@ -14,6 +14,8 @@ Dispatcharr stores one server URL per account. This proxy gives each account a l
 - **Avoids hammering the provider.** Attempts per request are capped. If everything fails, the account pauses for a while, and the pause doubles if failures continue.
 - **Sorts URLs every night.** The most reliable and fastest URLs move to the top of `upstreams.conf`. URLs are never removed.
 
+Tested on Dispatcharr 0.33.0.
+
 ## Install
 
 1. Copy `failover.py`, `upstreams.conf.example` and `docker-compose.example.yml` into a folder.
@@ -50,6 +52,7 @@ Set these as environment variables. The full list is at the top of `failover.py`
 | `BREAKER_SECONDS` | `60` | First pause after everything fails |
 | `SORT_AT` | `03:00` | Time of the nightly sort, or `off` |
 | `BIND` | `127.0.0.1` | Address the proxy listens on |
+| `SORT_USER_AGENT` | `m3u-failover` | User agent for the nightly sort. Change it if a provider refuses these logins |
 
 ## Security
 
