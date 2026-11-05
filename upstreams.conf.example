@@ -1,0 +1,17 @@
+# M3U / Xtream Codes failover upstreams. One [section] per Dispatcharr M3U account.
+# In Dispatcharr, set that account's Server URL to http://127.0.0.1:<port>.
+# Username and password stay on the account as usual.
+#
+# List every URL for the account, one per line, in order of preference.
+# Base URL only (scheme://host[:port]): no /get.php, no credentials.
+# URL changes are picked up within about 5 seconds. New sections or ports need a restart.
+
+[provider-a]
+port = 8091
+http://primary.provider-a.example:8080
+http://backup.provider-a.example:8080
+https://mirror.provider-a.example
+
+[provider-b]
+port = 8092
+http://provider-b.example

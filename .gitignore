@@ -1,0 +1,6 @@
+# Your real provider URLs
+upstreams.conf
+*.bak*
+__pycache__/
+*.pyc
+.env
