@@ -60,6 +60,22 @@ The proxy has no login of its own, so keep `BIND` on `127.0.0.1` unless you trus
 
 Keep `upstreams.conf` out of Git. It is already in `.gitignore`.
 
+## Changelog
+
+### 1.0.0
+- First public release.
+- The nightly sort now uses a neutral user agent by default. Set `SORT_USER_AGENT` to change it.
+
+### Before 1.0.0
+These changes were made before the project had version numbers.
+
+- **2026-11-05:** a 403 on one live feed now blocks only that feed, instead of pausing the whole account.
+- **2026-11-04:** added `BLOCKED_REDIRECT_HOSTS`, so a redirect to a block page counts as a failed URL.
+- **2026-11-03:** added the nightly sort.
+- **2026-11-03:** redirects to video servers are now followed by the proxy, so those streams show in its logs and status.
+- **2026-11-03:** added limits on attempts and account pauses, to avoid hammering providers.
+- **2026-11-03:** first version: fails over between an account's URLs before any data reaches Dispatcharr.
+
 ## Licence
 
 MIT
