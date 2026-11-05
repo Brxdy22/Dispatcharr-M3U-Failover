@@ -1,3 +1,5 @@
+<img src="logo.png" alt="" width="96">
+
 # Dispatcharr M3U Failover
 
 A small proxy that gives a [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr) M3U account several provider URLs.
