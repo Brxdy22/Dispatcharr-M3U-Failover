@@ -60,6 +60,13 @@ is left as is. Credentials are learned in memory from the requests Dispatcharr
 sends through the proxy (never logged or written); an account not seen since the
 proxy started is skipped. Run now: docker exec m3u-failover python /app/failover.py --sort-now
 
+A 404 from player_api.php (API_RETRY_STATUSES) is tried on the next URL after
+API_RETRY_DELAY seconds, up to API_RETRIES times: a provider can answer 404 to calls
+that come too close together, which would fail a whole account refresh.
+
+GET /__drop_live closes this account's live streams at once, so a client reconnects
+straight after a VPN exit change instead of waiting out its read timeout.
+
 Status: GET http://127.0.0.1:<port>/__status  (JSON, no credentials), including
 the streams playing right now and which URL/IP each one uses. Readable table:
     docker exec m3u-failover python /app/failover.py --status
@@ -110,6 +117,9 @@ FAILOVER_STATUSES = _parse_statuses(os.environ.get("FAILOVER_STATUSES", "403,500
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "4"))  # URLs per request
 IPS_PER_URL = int(os.environ.get("IPS_PER_URL", "2"))
 RECHECK_STATUSES = _parse_statuses(os.environ.get("RECHECK_STATUSES", "404,511"))
+API_RETRY_STATUSES = _parse_statuses(os.environ.get("API_RETRY_STATUSES", "404"))
+API_RETRIES = int(os.environ.get("API_RETRIES", "2"))
+API_RETRY_DELAY = float(os.environ.get("API_RETRY_DELAY", "2"))
 RECHECK_URLS = int(os.environ.get("RECHECK_URLS", "2"))  # extra URLs asked before trusting a 404
 NEG_CACHE = float(os.environ.get("NEG_CACHE_SECONDS", "30"))
 MAX_403_URLS = int(os.environ.get("MAX_403_URLS", "2"))
@@ -328,6 +338,7 @@ class Account:
 _STREAM_PATH = re.compile(r"^/(movie|series|live|timeshift)/[^/]+/[^/]+/(.+?)(?:\?.*)?$", re.I)
 _BARE_STREAM = re.compile(r"^/[^/]+/[^/]+/(\d+(?:\.\w+)?)$")
 ACTIVE = {}
+LIVE_SOCKS = {}  # entry id -> upstream socket of a live stream, for /__drop_live
 ACTIVE_LOCK = threading.Lock()
 _ids = iter(range(1, 1 << 62))
 
@@ -365,6 +376,19 @@ def active_for(account_name):
         r["transferred"] = human_bytes(r.pop("bytes"))
         r.pop("account")
     return rows
+
+
+def drop_live(account_name):
+    """Close the upstream side of an account's live streams; each relay then ends normally."""
+    with ACTIVE_LOCK:
+        socks = [s for entry_id, s in LIVE_SOCKS.items()
+                 if ACTIVE.get(entry_id, {}).get("account") == account_name]
+    for sock in socks:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    return len(socks)
 
 
 def label(target):
@@ -438,6 +462,10 @@ def make_handler(account):
                 started = start_sort("manual")
                 return self._send_simple(202 if started else 409, json.dumps(
                     {"sort": "started" if started else "already running"}))
+            if self.path == "/__drop_live":
+                dropped = drop_live(account.name)
+                log.info("[%s] dropped %d live stream(s) on request", account.name, dropped)
+                return self._send_simple(200, json.dumps({"dropped": dropped}))
             account.learn_creds(self.path)
 
             length = int(self.headers.get("Content-Length") or 0)
@@ -470,6 +498,7 @@ def make_handler(account):
 
             errors = []
             forbidden_hosts = set()
+            api_retries = 0
             soft_failed = []  # URLs that said 404/511 for this title; rested only if another URL plays it
             targets = account.order()
             for n, target in enumerate(targets, 1):
@@ -544,6 +573,15 @@ def make_handler(account):
                     if not one_feed or account.refuse_feed(self.path, stream_req[1], resp.reason):
                         account.trip(f"HTTP {resp.status} from {label(target)}"
                                      + (f" after {len(errors)} other failure(s)" if errors else ""))
+                elif (resp.status in API_RETRY_STATUSES and not last and api_retries < API_RETRIES
+                      and self.path.startswith("/player_api.php")):
+                    conn.close()
+                    api_retries += 1
+                    errors.append(f"{label(target)}: HTTP {resp.status}")
+                    log.warning("[%s] %s returned %s for the API; trying the next URL in %gs",
+                                account.name, label(target), resp.status, API_RETRY_DELAY)
+                    time.sleep(API_RETRY_DELAY)
+                    continue
                 elif stream_req and resp.status in RECHECK_STATUSES:
                     if not last and len(soft_failed) < RECHECK_URLS:
                         conn.close()
@@ -641,6 +679,8 @@ def make_handler(account):
                     ACTIVE[entry_id] = {"account": account.name, "type": stream[0], "stream": stream[1],
                                         "via": via, "range": rng, "client": self.client_address[0],
                                         "started": time.time(), "bytes": 0}
+                    if stream[0] == "live":
+                        LIVE_SOCKS[entry_id] = sock
                 log.info("[%s] > %s %s via %s%s", account.name, stream[0], stream[1], via,
                          f" ({rng})" if rng else "")
             try:
@@ -683,6 +723,7 @@ def make_handler(account):
                 if entry_id:
                     with ACTIVE_LOCK:
                         e = ACTIVE.pop(entry_id)
+                        LIVE_SOCKS.pop(entry_id, None)
                     log.info("[%s] # %s %s via %s ended after %s, %s (%s)", account.name, e["type"],
                              e["stream"], e["via"], human_secs(time.time() - e["started"]),
                              human_bytes(e["bytes"]), outcome)

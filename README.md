@@ -50,9 +50,14 @@ Set these as environment variables. The full list is at the top of `failover.py`
 | `FAILOVER_STATUSES` | `403,500,502,503,504,520-530` | Answers that move on to the next URL |
 | `MAX_ATTEMPTS` | `4` | Most URLs tried per request |
 | `BREAKER_SECONDS` | `60` | First pause after everything fails |
+| `API_RETRY_STATUSES` | `404` | `player_api.php` answers that are tried again on the next URL |
+| `API_RETRIES` | `2` | Most extra URLs tried for one API call |
+| `API_RETRY_DELAY` | `2` | Seconds to wait before that retry |
 | `SORT_AT` | `03:00` | Time of the nightly sort, or `off` |
 | `BIND` | `127.0.0.1` | Address the proxy listens on |
 | `SORT_USER_AGENT` | `m3u-failover` | User agent for the nightly sort. Change it if a provider refuses these logins |
+
+`GET /__drop_live` on an account's port closes its live streams at once, so clients reconnect right after a VPN exit change instead of waiting for a read timeout. Gluetun AutoSwitch calls it after every switch.
 
 ## Security
 
@@ -60,21 +65,9 @@ The proxy has no login of its own, so keep `BIND` on `127.0.0.1` unless you trus
 
 Keep `upstreams.conf` out of Git. It is already in `.gitignore`.
 
-## Changelog
+## Release notes
 
-### 1.0.0
-- First public release.
-- The nightly sort now uses a neutral user agent by default. Set `SORT_USER_AGENT` to change it.
-
-### Before 1.0.0
-These changes were made before the project had version numbers.
-
-- **2026-11-05:** a 403 on one live feed now blocks only that feed, instead of pausing the whole account.
-- **2026-11-04:** added `BLOCKED_REDIRECT_HOSTS`, so a redirect to a block page counts as a failed URL.
-- **2026-11-03:** added the nightly sort.
-- **2026-11-03:** redirects to video servers are now followed by the proxy, so those streams show in its logs and status.
-- **2026-11-03:** added limits on attempts and account pauses, to avoid hammering providers.
-- **2026-11-03:** first version: fails over between an account's URLs before any data reaches Dispatcharr.
+See [Releases](https://github.com/Brxdy22/Dispatcharr-M3U-Failover/releases/latest).
 
 ## Licence
 
