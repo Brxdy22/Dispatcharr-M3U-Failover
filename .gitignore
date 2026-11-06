@@ -4,3 +4,4 @@ upstreams.conf
 __pycache__/
 *.pyc
 .env
+vod_canaries.json

@@ -67,6 +67,20 @@ that come too close together, which would fail a whole account refresh.
 GET /__drop_live closes this account's live streams at once, so a client reconnects
 straight after a VPN exit change instead of waiting out its read timeout.
 
+A refused exit can look like a missing title: the provider answers 404 on every URL.
+So when every URL agrees on a 404 for a movie or episode, up to CANARIES titles that
+played on this account before are asked for one byte. If they are refused too, the
+exit is refused, not the title: Gluetun AutoSwitch (EXIT_HOOK_URL) blocks the exit and
+moves, and the request is tried again on the new exit while the client still waits.
+All of it fits in REQUEST_DEADLINE_SECONDS, below Dispatcharr's 10 s read timeout. With
+no such title yet, a movie is looked up in the catalogue instead (get_vod_info). The
+titles are kept in CANARY_FILE as type and file name only, never with the login.
+
+GET /__vod_check asks the remembered titles the same way, on up to RECHECK_URLS + 1 URLs
+each, for Gluetun AutoSwitch's background check. It does nothing while this account is
+streaming (one connection slot) and logs nothing unless the titles are refused.
+?forget=1 also forgets titles found refused, used after the exit has already moved.
+
 Status: GET http://127.0.0.1:<port>/__status  (JSON, no credentials), including
 the streams playing right now and which URL/IP each one uses. Readable table:
     docker exec m3u-failover python /app/failover.py --status
@@ -87,7 +101,8 @@ import ipaddress
 import random
 import statistics
 import tempfile
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit
+import urllib.request
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 
 CONFIG = os.environ.get("CONFIG", "/config/upstreams.conf")
 BIND = os.environ.get("BIND", "127.0.0.1")
@@ -128,6 +143,15 @@ BREAKER_MAX = float(os.environ.get("BREAKER_MAX_SECONDS", "600"))
 FEED_403_SECONDS = float(os.environ.get("FEED_403_SECONDS", "300"))
 FEED_403_LIMIT = int(os.environ.get("FEED_403_LIMIT", "3"))
 FOLLOW_REDIRECTS = os.environ.get("FOLLOW_REDIRECTS", "1") not in ("0", "false", "no")
+EXIT_HOOK_URL = os.environ.get("EXIT_HOOK_URL", "http://127.0.0.1:9733/vod-blocked").strip()
+if EXIT_HOOK_URL.lower() in ("", "off", "0", "no"):
+    EXIT_HOOK_URL = ""
+REQUEST_DEADLINE = float(os.environ.get("REQUEST_DEADLINE_SECONDS", "9"))  # Dispatcharr waits 10 s
+RETRY_RESERVE = 1.5  # time kept for the retry on the new exit
+CANARIES = int(os.environ.get("CANARIES", "2"))
+CANARY_TIMEOUT = 3.0
+CANARY_FILE = os.environ.get("CANARY_FILE", os.path.join(os.path.dirname(CONFIG), "vod_canaries.json"))
+VOD_KINDS = ("movie", "series")
 MAX_REDIRECTS = 5
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
@@ -212,7 +236,40 @@ class Account:
         self.last_sort = None  # summary of the last nightly sort
         self.missing = {}      # playback path -> (expires, status, reason): recent agreed 404s, refused feeds
         self.refused_feeds = {}  # live feed -> time it was last refused with a 403
+        self.canaries = [tuple(c) for c in CANARY_DATA.get(name, [])][:CANARIES * 2]  # (kind, file) that played
         self.set_urls(urls)
+
+    def note_played(self, kind, leaf):
+        """Remember a movie or episode that played, newest first, to tell a refused exit
+        from a missing title later. Saved only when the list changes."""
+        with self.lock:
+            if self.canaries[:1] == [(kind, leaf)]:
+                return
+            self.canaries = [(kind, leaf)] + [c for c in self.canaries if c != (kind, leaf)]
+            self.canaries = self.canaries[:CANARIES * 2]
+            save_canaries(self.name, self.canaries)
+
+    def canary_paths(self, leaf=None):
+        """[(file, request path)] of remembered titles other than this one, with the login."""
+        with self.lock:
+            creds, canaries = self.creds, list(self.canaries)
+        if not creds:
+            return []
+        user, password = (quote(part, safe="") for part in creds)
+        return [(f, f"/{kind}/{user}/{password}/{f}") for kind, f in canaries if f != leaf][:CANARIES]
+
+    def drop_canaries(self, leaves):
+        with self.lock:
+            kept = [c for c in self.canaries if c[1] not in leaves]
+            if kept != self.canaries:
+                self.canaries = kept
+                save_canaries(self.name, kept)
+
+    def forget_missing(self):
+        """The exit changed: titles answered 404 on the old one may play now."""
+        with self.lock:
+            for path in [p for p, hit in self.missing.items() if hit[1] != 403]:
+                self.missing.pop(path, None)
 
     def learn_creds(self, path):
         """Remember the XC login from a request path (query or /movie/u/p/...). Never logged."""
@@ -327,6 +384,7 @@ class Account:
                 "active_streams": active_for(self.name),
                 "last_sort": self.last_sort,
                 "login_known": self.creds is not None,
+                "known_good_titles": len(self.canaries),
                 "failures": [{
                     "target": host_of(u),
                     "cooling_down_seconds": max(0, int(self.bad_until.get(u, 0) - now)),
@@ -427,6 +485,54 @@ def load_config(path):
     return accounts
 
 
+CANARY_DATA = {}
+CANARY_LOCK = threading.Lock()
+
+
+def load_canaries():
+    try:
+        with open(CANARY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): [list(c)[:2] for c in v if isinstance(c, (list, tuple)) and len(c) >= 2]
+                for k, v in data.items() if isinstance(v, list)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_canaries(name, canaries):
+    """Type and file name only: the login stays in memory."""
+    with CANARY_LOCK:
+        CANARY_DATA[name] = [list(c) for c in canaries]
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CANARY_FILE) or ".", prefix=".vod_canaries.")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(CANARY_DATA, f, indent=1)
+            os.replace(tmp, CANARY_FILE)
+        except OSError as e:
+            log.warning("could not save %s: %s", CANARY_FILE, e)
+
+
+def canary_verdict(status, location=None):
+    """'plays', 'missing' or None for one remembered title's answer."""
+    if status in RECHECK_STATUSES:
+        return "missing"
+    if status in REDIRECT_STATUSES:
+        return None if is_blocked_host(urlsplit(location or "").hostname) else "plays"
+    if 200 <= status < 300:
+        return "plays"
+    return None
+
+
+def listed_movie(body):
+    """Whether a get_vod_info answer describes a real movie: True, False, or None if unreadable."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    movie = data.get("movie_data") if isinstance(data, dict) else None
+    return bool(isinstance(movie, dict) and movie.get("stream_id"))
+
+
 def make_handler(account):
     ssl_ctx = ssl.create_default_context()
     if not VERIFY_TLS:
@@ -462,10 +568,13 @@ def make_handler(account):
                 started = start_sort("manual")
                 return self._send_simple(202 if started else 409, json.dumps(
                     {"sort": "started" if started else "already running"}))
+            if self.path.split("?", 1)[0] == "/__vod_check":
+                return self._send_simple(200, json.dumps(self._vod_check("forget=1" in self.path)))
             if self.path == "/__drop_live":
                 dropped = drop_live(account.name)
                 log.info("[%s] dropped %d live stream(s) on request", account.name, dropped)
                 return self._send_simple(200, json.dumps({"dropped": dropped}))
+            started = time.monotonic()
             account.learn_creds(self.path)
 
             length = int(self.headers.get("Content-Length") or 0)
@@ -496,127 +605,256 @@ def make_handler(account):
                     self.wfile.write(data)
                 return
 
-            errors = []
-            forbidden_hosts = set()
-            api_retries = 0
-            soft_failed = []  # URLs that said 404/511 for this title; rested only if another URL plays it
-            targets = account.order()
-            for n, target in enumerate(targets, 1):
-                last = n == len(targets)
-                base, ips = target
-                u = urlsplit(base)
-                conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-                kwargs = {"context": ssl_ctx} if u.scheme == "https" else {}
-                resp, conn_errors = None, []
-                for ip in ips:  # another edge IP only when the connection itself fails
-                    conn = conn_cls(u.hostname, u.port, timeout=CONNECT_TIMEOUT, **kwargs)
-                    if ip:  # pin the edge IP; Host header and TLS SNI still use the hostname
-                        conn._create_connection = lambda addr, timeout, src, ip=ip: \
-                            socket.create_connection((ip, addr[1]), timeout, src)
-                    try:
-                        conn.connect()
-                        sock = conn.sock  # http.client drops conn.sock once the response will close
-                        sock.settimeout(HEADER_TIMEOUT)
-                        conn.request(self.command, u.path.rstrip("/") + self.path, body=body,
-                                     headers={**headers, "Host": u.netloc})
-                        resp = conn.getresponse()
-                        break
-                    except (OSError, http.client.HTTPException, ssl.SSLError) as e:
-                        conn.close()
-                        conn_errors.append(f"{label((base, ip))}: {type(e).__name__}: {e}")
-                if resp is None:
-                    reason = "; ".join(conn_errors)
-                    account.mark_bad(base, reason)
-                    errors.extend(conn_errors)
-                    log.warning("[%s] %s failed for %s %s", account.name, reason, self.command,
-                                redact(self.path))
-                    continue
-                target = (base, ip)
+            deadline = started + REQUEST_DEADLINE
+            exit_checked, moved = False, False
 
-                via = label(target)
-                if FOLLOW_REDIRECTS and resp.status in REDIRECT_STATUSES and self.command in ("GET", "HEAD") \
-                        and stream_of(self.path):
-                    origin = f"{u.scheme}://{u.netloc}{u.path.rstrip('/')}{self.path}"
-                    try:
-                        conn, sock, resp, hops = self._follow(conn, sock, resp, origin, headers)
-                    except RedirectFailed as e:
-                        # The provider URL answered; its video server didn't. Ask the next target,
-                        # which normally hands out a fresh (often different) server.
-                        if e.blocked:  # this mirror can't serve video at all: rest it
-                            account.mark_bad(base, f"redirects to {e}")
-                        errors.append(f"{via} -> {e}")
-                        log.warning("[%s] video server failed for %s %s (%s -> %s)", account.name,
-                                    self.command, redact(self.path), via, e)
+            def limit(seconds):
+                """After a move the retry must finish before the client gives up."""
+                return max(1.0, min(seconds, deadline - time.monotonic())) if moved else seconds
+
+            while True:
+                errors = []
+                forbidden_hosts = set()
+                api_retries = 0
+                soft_failed = []  # URLs that said 404/511 for this title; rested only if another URL plays it
+                retry = False
+                targets = account.order()
+                for n, target in enumerate(targets, 1):
+                    last = n == len(targets)
+                    base, ips = target
+                    u = urlsplit(base)
+                    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+                    kwargs = {"context": ssl_ctx} if u.scheme == "https" else {}
+                    resp, conn_errors = None, []
+                    for ip in ips:  # another edge IP only when the connection itself fails
+                        conn = conn_cls(u.hostname, u.port, timeout=limit(CONNECT_TIMEOUT), **kwargs)
+                        if ip:  # pin the edge IP; Host header and TLS SNI still use the hostname
+                            conn._create_connection = lambda addr, timeout, src, ip=ip: \
+                                socket.create_connection((ip, addr[1]), timeout, src)
+                        try:
+                            conn.connect()
+                            sock = conn.sock  # http.client drops conn.sock once the response will close
+                            sock.settimeout(limit(HEADER_TIMEOUT))
+                            conn.request(self.command, u.path.rstrip("/") + self.path, body=body,
+                                         headers={**headers, "Host": u.netloc})
+                            resp = conn.getresponse()
+                            break
+                        except (OSError, http.client.HTTPException, ssl.SSLError) as e:
+                            conn.close()
+                            conn_errors.append(f"{label((base, ip))}: {type(e).__name__}: {e}")
+                    if resp is None:
+                        reason = "; ".join(conn_errors)
+                        account.mark_bad(base, reason)
+                        errors.extend(conn_errors)
+                        log.warning("[%s] %s failed for %s %s", account.name, reason, self.command,
+                                    redact(self.path))
                         continue
-                    if hops:
-                        via = f"{via} -> {hops}"
+                    target = (base, ip)
 
-                if resp.status in FAILOVER_STATUSES:
-                    account.mark_bad(base, f"HTTP {resp.status}")
-                    if resp.status == 403:
-                        forbidden_hosts.add(u.hostname)
-                        if len(forbidden_hosts) >= MAX_403_URLS:
-                            last = True  # several URLs refuse us: a block, not a bad edge
-                    if not last:
+                    via = label(target)
+                    if FOLLOW_REDIRECTS and resp.status in REDIRECT_STATUSES and self.command in ("GET", "HEAD") \
+                            and stream_of(self.path):
+                        origin = f"{u.scheme}://{u.netloc}{u.path.rstrip('/')}{self.path}"
+                        try:
+                            conn, sock, resp, hops = self._follow(conn, sock, resp, origin, headers)
+                        except RedirectFailed as e:
+                            # The provider URL answered; its video server didn't. Ask the next target,
+                            # which normally hands out a fresh (often different) server.
+                            if e.blocked:  # this mirror can't serve video at all: rest it
+                                account.mark_bad(base, f"redirects to {e}")
+                            errors.append(f"{via} -> {e}")
+                            log.warning("[%s] video server failed for %s %s (%s -> %s)", account.name,
+                                        self.command, redact(self.path), via, e)
+                            continue
+                        if hops:
+                            via = f"{via} -> {hops}"
+
+                    if resp.status in FAILOVER_STATUSES:
+                        account.mark_bad(base, f"HTTP {resp.status}")
+                        if resp.status == 403:
+                            forbidden_hosts.add(u.hostname)
+                            if len(forbidden_hosts) >= MAX_403_URLS:
+                                last = True  # several URLs refuse us: a block, not a bad edge
+                        if not last:
+                            conn.close()
+                            errors.append(f"{label(target)}: HTTP {resp.status}")
+                            log.warning("[%s] %s returned %s for %s %s", account.name, label(target), resp.status,
+                                        self.command, redact(self.path))
+                            continue
+                        # Nothing left to try: hand the client the provider's real answer.
+                        log.error("[%s] giving up on %s %s; passing through HTTP %s (%s)",
+                                  account.name, self.command, redact(self.path), resp.status,
+                                  "; ".join(errors) or "no other targets")
+                        # Every URL asked refused this one live feed: only a block if other feeds are refused too
+                        one_feed = (resp.status == 403 and stream_req and stream_req[0] == "live"
+                                    and len(errors) == len(forbidden_hosts) - 1)
+                        if not one_feed or account.refuse_feed(self.path, stream_req[1], resp.reason):
+                            account.trip(f"HTTP {resp.status} from {label(target)}"
+                                         + (f" after {len(errors)} other failure(s)" if errors else ""))
+                    elif (resp.status in API_RETRY_STATUSES and not last and api_retries < API_RETRIES
+                          and self.path.startswith("/player_api.php")):
                         conn.close()
+                        api_retries += 1
                         errors.append(f"{label(target)}: HTTP {resp.status}")
-                        log.warning("[%s] %s returned %s for %s %s", account.name, label(target), resp.status,
-                                    self.command, redact(self.path))
+                        log.warning("[%s] %s returned %s for the API; trying the next URL in %gs",
+                                    account.name, label(target), resp.status, API_RETRY_DELAY)
+                        time.sleep(API_RETRY_DELAY)
                         continue
-                    # Nothing left to try: hand the client the provider's real answer.
-                    log.error("[%s] giving up on %s %s; passing through HTTP %s (%s)",
-                              account.name, self.command, redact(self.path), resp.status,
-                              "; ".join(errors) or "no other targets")
-                    # Every URL asked refused this one live feed: only a block if other feeds are refused too
-                    one_feed = (resp.status == 403 and stream_req and stream_req[0] == "live"
-                                and len(errors) == len(forbidden_hosts) - 1)
-                    if not one_feed or account.refuse_feed(self.path, stream_req[1], resp.reason):
-                        account.trip(f"HTTP {resp.status} from {label(target)}"
-                                     + (f" after {len(errors)} other failure(s)" if errors else ""))
-                elif (resp.status in API_RETRY_STATUSES and not last and api_retries < API_RETRIES
-                      and self.path.startswith("/player_api.php")):
-                    conn.close()
-                    api_retries += 1
-                    errors.append(f"{label(target)}: HTTP {resp.status}")
-                    log.warning("[%s] %s returned %s for the API; trying the next URL in %gs",
-                                account.name, label(target), resp.status, API_RETRY_DELAY)
-                    time.sleep(API_RETRY_DELAY)
-                    continue
-                elif stream_req and resp.status in RECHECK_STATUSES:
-                    if not last and len(soft_failed) < RECHECK_URLS:
-                        conn.close()
-                        soft_failed.append(base)
-                        errors.append(f"{label(target)}: HTTP {resp.status}")
-                        log.warning("[%s] %s returned %s for %s %s; checking another URL", account.name,
-                                    label(target), resp.status, stream_req[0], stream_req[1])
-                        continue
-                    # Every URL asked agrees: the title really isn't there (or the account is refused).
-                    if NEG_CACHE:
-                        now = time.time()
-                        for k in [k for k, v in account.missing.items() if v[0] <= now]:
-                            account.missing.pop(k, None)
-                        account.missing[self.path] = (now + NEG_CACHE, resp.status, resp.reason or "")
-                    if soft_failed:
-                        log.warning("[%s] %s %s: HTTP %s from %d URL(s); answering it locally for %ds",
-                                    account.name, stream_req[0], stream_req[1], resp.status,
-                                    len(soft_failed) + 1, int(NEG_CACHE))
-                else:
-                    for b in soft_failed:  # this URL plays a title those called missing: rest them
-                        account.mark_bad(b, "HTTP 404/511 for a title another URL serves")
-                    if errors:
-                        log.info("[%s] failed over to %s after: %s", account.name, label(target),
-                                 "; ".join(errors))
-                    account.mark_good(target)
-                    if stream_req and stream_req[0] == "live" and resp.status < 400:
-                        account.feed_played()
-                log.debug("[%s] %s %s -> %s %s", account.name, self.command, redact(self.path),
-                          via, resp.status)
-                self._relay(resp, conn, sock, via)
-                return
+                    elif stream_req and resp.status in RECHECK_STATUSES:
+                        if not last and len(soft_failed) < RECHECK_URLS:
+                            conn.close()
+                            soft_failed.append(base)
+                            errors.append(f"{label(target)}: HTTP {resp.status}")
+                            log.warning("[%s] %s returned %s for %s %s; checking another URL", account.name,
+                                        label(target), resp.status, stream_req[0], stream_req[1])
+                            continue
+                        # Every URL asked agrees: the title really isn't there, or the exit is refused.
+                        if (resp.status == 404 and soft_failed and stream_req[0] in VOD_KINDS
+                                and EXIT_HOOK_URL and not exit_checked):
+                            exit_checked = True
+                            refused, asked = self._exit_refused(stream_req, headers, deadline)
+                            if refused:
+                                log.warning("[%s] %s %s: every URL says 404, and so do %s; asking Gluetun "
+                                            "AutoSwitch to move the exit", account.name, stream_req[0],
+                                            stream_req[1], f"{len(asked)} title(s) that played before"
+                                            if asked else "a listed movie")
+                                answer = self._ask_autoswitch(stream_req, deadline) or {}
+                                if answer.get("moved") and answer.get("ready"):
+                                    conn.close()
+                                    account.forget_missing()
+                                    moved, retry = asked or True, True
+                                    log.warning("[%s] exit moved (%s); trying %s %s again", account.name,
+                                                answer.get("exit") or answer.get("detail") or "new exit",
+                                                stream_req[0], stream_req[1])
+                                    break
+                                log.warning("[%s] exit not moved: %s", account.name,
+                                            answer.get("detail") or "no answer")
+                        elif moved and resp.status == 404 and soft_failed and stream_req[0] in VOD_KINDS:
+                            # Still 404 on a new exit: the remembered titles may be gone, not the exit.
+                            if isinstance(moved, list):
+                                account.drop_canaries(moved)
+                            log.warning("[%s] %s %s: still 404 after the exit moved", account.name,
+                                        stream_req[0], stream_req[1])
+                        if NEG_CACHE:
+                            now = time.time()
+                            for k in [k for k, v in account.missing.items() if v[0] <= now]:
+                                account.missing.pop(k, None)
+                            account.missing[self.path] = (now + NEG_CACHE, resp.status, resp.reason or "")
+                        if soft_failed:
+                            log.warning("[%s] %s %s: HTTP %s from %d URL(s); answering it locally for %ds",
+                                        account.name, stream_req[0], stream_req[1], resp.status,
+                                        len(soft_failed) + 1, int(NEG_CACHE))
+                    else:
+                        for b in soft_failed:  # this URL plays a title those called missing: rest them
+                            account.mark_bad(b, "HTTP 404/511 for a title another URL serves")
+                        if errors:
+                            log.info("[%s] failed over to %s after: %s", account.name, label(target),
+                                     "; ".join(errors))
+                        account.mark_good(target)
+                        if stream_req and stream_req[0] == "live" and resp.status < 400:
+                            account.feed_played()
+                        if stream_req and stream_req[0] in VOD_KINDS and 200 <= resp.status < 300:
+                            account.note_played(*stream_req)
+                            if moved:
+                                log.info("[%s] %s %s plays on the new exit", account.name, *stream_req)
+                    log.debug("[%s] %s %s -> %s %s", account.name, self.command, redact(self.path),
+                              via, resp.status)
+                    self._relay(resp, conn, sock, via)
+                    return
 
-            log.error("[%s] all upstreams failed for %s %s", account.name, self.command, redact(self.path))
-            account.trip(f"all {len(errors)} target(s) unreachable")
-            self._send_simple(502, json.dumps({"error": "all upstreams failed", "attempts": errors}))
+                if retry:
+                    if time.monotonic() < deadline - 0.5:
+                        continue
+                    # Out of time: the next request plays on the new exit, so nothing is cached.
+                    self.close_connection = True
+                    return self._send_simple(404, json.dumps({"error": "HTTP 404", "exit_moved": True}))
+                log.error("[%s] all upstreams failed for %s %s", account.name, self.command, redact(self.path))
+                if not moved:  # a tunnel that just reconnected is no reason to pause the account
+                    account.trip(f"all {len(errors)} target(s) unreachable")
+                return self._send_simple(502, json.dumps({"error": "all upstreams failed", "attempts": errors}))
+
+        def _vod_check(self, forget):
+            """{checked, refused, asked}: are the remembered titles refused on every URL?"""
+            if active_for(account.name):
+                return {"checked": False, "detail": "streaming now"}
+            canaries = account.canary_paths()
+            if not canaries:
+                return {"checked": False, "detail": "no title has played yet" if account.creds
+                        else "login not seen since the proxy started"}
+            deadline = time.monotonic() + 20
+            headers = {"User-Agent": SORT_UA, "Range": "bytes=0-0", "Accept-Encoding": "identity"}
+            refused = []
+            for leaf, path in canaries:
+                for target in account.order()[:RECHECK_URLS + 1]:
+                    answer = self._ask(path, headers, deadline, target)
+                    if not answer or canary_verdict(answer[0], answer[1]) != "missing":
+                        return {"checked": True, "refused": False, "asked": len(refused) + 1}
+                refused.append(leaf)
+            log.warning("[%s] background check: %d title(s) that played before are refused on every URL",
+                        account.name, len(refused))
+            if forget:
+                account.drop_canaries(refused)
+            return {"checked": True, "refused": True, "asked": len(refused)}
+
+        def _ask(self, path, headers, deadline, target=None):
+            """(status, Location, body) of one small request to a URL (the first by default), or None."""
+            targets = [target] if target else account.order()
+            if not targets:
+                return None
+            base, ips = targets[0]
+            u = urlsplit(base)
+            timeout = max(0.5, min(CANARY_TIMEOUT, deadline - time.monotonic()))
+            conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+            kwargs = {"context": ssl_ctx} if u.scheme == "https" else {}
+            conn = conn_cls(u.hostname, u.port, timeout=timeout, **kwargs)
+            ip = ips[0] if ips else None
+            if ip:
+                conn._create_connection = lambda addr, t, src, ip=ip: socket.create_connection((ip, addr[1]), t, src)
+            try:
+                conn.request("GET", u.path.rstrip("/") + path, headers={**headers, "Host": u.netloc})
+                resp = conn.getresponse()
+                body = resp.read(65536) if resp.status == 200 and path.startswith("/player_api.php") else b""
+                return resp.status, resp.getheader("Location"), body
+            except (OSError, http.client.HTTPException, ssl.SSLError):
+                return None
+            finally:
+                conn.close()
+
+        def _exit_refused(self, stream_req, headers, deadline):
+            """(refused, files asked). Refused when every remembered title that played before
+            is missing too; with none remembered, when the catalogue lists the movie."""
+            asked = []
+            plain = {k: v for k, v in headers.items() if k.lower() not in ("range", "accept-encoding")}
+            plain["Accept-Encoding"] = "identity"  # the catalogue answer is read here, not relayed
+            canaries = account.canary_paths(stream_req[1])
+            for leaf, path in canaries:
+                answer = self._ask(path, {**plain, "Range": "bytes=0-0"}, deadline)
+                asked.append(leaf)
+                if not answer or canary_verdict(answer[0], answer[1]) != "missing":
+                    return False, asked
+            if canaries:
+                return True, asked
+            if stream_req[0] != "movie" or not account.creds:
+                return False, asked
+            vod_id = stream_req[1].split(".", 1)[0]
+            query = urlencode({"username": account.creds[0], "password": account.creds[1],
+                               "action": "get_vod_info", "vod_id": vod_id})
+            answer = self._ask(f"/player_api.php?{query}", plain, deadline)
+            return bool(answer and answer[0] == 200 and listed_movie(answer[2])), asked
+
+        def _ask_autoswitch(self, stream_req, deadline):
+            """Gluetun AutoSwitch's answer, or None. It waits for the new tunnel within budget."""
+            budget = deadline - time.monotonic() - RETRY_RESERVE
+            if budget < 1:
+                return {"moved": False, "detail": "no time left to move"}
+            body = json.dumps({"port": account.port, "account": account.name,
+                               "title": f"{stream_req[0]} {stream_req[1]}", "budget": round(budget, 1)}).encode()
+            request = urllib.request.Request(EXIT_HOOK_URL, data=body, headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=budget + 1) as response:
+                    return json.loads(response.read())
+            except Exception as e:
+                return {"moved": False, "detail": f"Gluetun AutoSwitch not reachable ({type(e).__name__})"}
 
         def _follow(self, conn, sock, resp, current, headers):
             """Follow provider redirects ourselves. Returns (conn, sock, resp, 'host -> host')."""
@@ -997,6 +1235,7 @@ def main():
     if not cfg:
         log.error("no accounts in %s", CONFIG)
         sys.exit(1)
+    CANARY_DATA.update(load_canaries())
     accounts = {}
     for name, (port, urls) in cfg.items():
         acct = Account(name, port, urls)

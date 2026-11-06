@@ -12,6 +12,7 @@ Dispatcharr stores one server URL per account. This proxy gives each account a l
 - **Leaves account errors alone.** 401, 458 and 460 (connection limit) are passed straight through, because another URL would give the same answer.
 - **Double-checks 404s.** A 404 or 511 on a video is checked on other URLs, because a mirror can fail for every title while the others still work.
 - **Avoids hammering the provider.** Attempts per request are capped. If everything fails, the account pauses for a while, and the pause doubles if failures continue.
+- **Tells a refused VPN exit from a missing title.** When every URL answers 404 for a movie or episode, it asks a title that played before for one byte. If that is refused too, [Gluetun AutoSwitch](https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin) 1.7 or later moves the exit, and the same request plays on the new exit.
 - **Sorts URLs every night.** The most reliable and fastest URLs move to the top of `upstreams.conf`. URLs are never removed.
 
 Tested on Dispatcharr 0.33.0.
@@ -55,9 +56,15 @@ Set these as environment variables. The full list is at the top of `failover.py`
 | `API_RETRY_DELAY` | `2` | Seconds to wait before that retry |
 | `SORT_AT` | `03:00` | Time of the nightly sort, or `off` |
 | `BIND` | `127.0.0.1` | Address the proxy listens on |
+| `EXIT_HOOK_URL` | `http://127.0.0.1:9733/vod-blocked` | Where to ask Gluetun AutoSwitch to move a refused exit, or `off` |
+| `REQUEST_DEADLINE_SECONDS` | `9` | Most time a VOD request may take, including an exit move. Keep it below Dispatcharr's 10 s read timeout |
+| `CANARIES` | `2` | Titles that played before, asked to tell a refused exit from a missing title |
+| `CANARY_FILE` | `vod_canaries.json` next to `upstreams.conf` | Where those titles are kept: type and file name only, never the login |
 | `SORT_USER_AGENT` | `m3u-failover` | User agent for the nightly sort. Change it if a provider refuses these logins |
 
 `GET /__drop_live` on an account's port closes its live streams at once, so clients reconnect right after a VPN exit change instead of waiting for a read timeout. Gluetun AutoSwitch calls it after every switch.
+
+`GET /__vod_check` asks the remembered titles for one byte and answers whether the exit is refused. Gluetun AutoSwitch calls it in the background while nobody is watching. Add `?forget=1` to also forget titles that were refused.
 
 ## Security
 
