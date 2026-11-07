@@ -14,6 +14,7 @@ Dispatcharr stores one server URL per account. This proxy gives each account a l
 - **Avoids hammering the provider.** Attempts per request are capped. If everything fails, the account pauses for a while, and the pause doubles if failures continue.
 - **Tells a refused VPN exit from a missing title.** When every URL answers 404 for a movie or episode, it asks a title that played before for one byte. If that is refused too, [Gluetun AutoSwitch](https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin) 1.7 or later moves the exit, and the same request plays on the new exit.
 - **Sorts URLs every night.** The most reliable and fastest URLs move to the top of `upstreams.conf`. URLs are never removed.
+- **Edits from Dispatcharr.** With the [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin) plugin 1.5, you can see and change each account's URLs on the plugin page.
 
 Tested on Dispatcharr 0.33.0.
 
@@ -67,6 +68,8 @@ Set these as environment variables. The full list is at the top of `failover.py`
 `GET /__before_move?hold=N` on an account's port closes all its streams, VOD included, and holds new requests for up to 6 seconds while the exit moves. `/__drop_live` ends the hold early. Gluetun AutoSwitch 1.8.2 calls it just before every switch.
 
 `GET /__status` shows `stuck_slot_seconds` for an account whose provider keeps answering with a connection limit (458 or 460) while nothing is streaming. During that time the proxy answers repeat requests itself, so the provider sees about one try every 15 seconds.
+
+`POST /__urls` with `{"urls": [...]}` on an account's port replaces that account's URLs in `upstreams.conf` and uses them at once. Notes on URLs that stay are kept. It is accepted only from loopback, and only base URLs (`scheme://host[:port]`) without logins. The [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin) plugin 1.5 uses it to show and edit the lists from Dispatcharr. `GET /__status` lists the full URLs under `urls`.
 
 `GET /__vod_check` asks the remembered titles for one byte and answers whether the exit is refused. Gluetun AutoSwitch calls it in the background while nobody is watching. Add `?forget=1` to also forget titles that were refused.
 

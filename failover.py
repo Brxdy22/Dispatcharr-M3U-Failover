@@ -93,6 +93,11 @@ each, for Gluetun AutoSwitch's background check. It does nothing while this acco
 streaming (one connection slot) and logs nothing unless the titles are refused.
 ?forget=1 also forgets titles found refused, used after the exit has already moved.
 
+POST /__urls with {"urls": [...]} replaces this account's URL list in upstreams.conf and
+applies it at once (used by the VOD Failover plugin's Mirror URLs section). Only accepted
+from loopback; base URLs only (scheme://host[:port]), no logins, paths or queries. Notes
+on URLs that stay are kept; comments and commented-out URLs are left alone.
+
 Status: GET http://127.0.0.1:<port>/__status  (JSON, no credentials), including
 the streams playing right now and which URL/IP each one uses. Readable table:
     docker exec m3u-failover python /app/failover.py --status
@@ -448,6 +453,7 @@ class Account:
                 "stuck_slot_seconds": int(now - self.limit_first) if self.limit_logged else 0,
                 "pause_reason": self.pause_reason if self.paused_until > now else None,
                 "upstreams": [host_of(u) for u in self.urls],
+                "urls": list(self.urls),
                 "active_streams": active_for(self.name),
                 "last_sort": self.last_sort,
                 "login_known": self.creds is not None,
@@ -644,9 +650,31 @@ def make_handler(account):
             if self.command != "HEAD":
                 self.wfile.write(data)
 
+        def _set_urls(self):
+            if self.command != "POST":
+                return self._send_simple(405, json.dumps({"error": "use POST"}))
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                return self._send_simple(403, json.dumps({"error": "only accepted from loopback"}))
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= 65536:
+                    raise ValueError("body missing or too large")
+                urls = clean_urls(json.loads(self.rfile.read(length)).get("urls"))
+                changed = write_urls(account.name, urls)
+            except (ValueError, AttributeError, TypeError) as e:
+                return self._send_simple(400, json.dumps({"error": str(e)}))
+            except OSError as e:
+                return self._send_simple(500, json.dumps({"error": f"could not write the config: {e}"}))
+            account.set_urls(urls)
+            if changed:
+                log.info("[%s] URL list replaced on request (%d URL(s))", account.name, len(urls))
+            return self._send_simple(200, json.dumps({"changed": changed, "urls": account.status()["urls"]}))
+
         def _proxy(self):
             if self.path == "/__status":
                 return self._send_simple(200, json.dumps(account.status(), indent=2))
+            if self.path == "/__urls":
+                return self._set_urls()
             if self.path == "/__sort":
                 started = start_sort("manual")
                 return self._send_simple(202 if started else 409, json.dumps(
@@ -1181,7 +1209,94 @@ def _note(x):
     return f"{x['kind']}, {x['median'] * 1000:.0f} ms median{rel}"
 
 
+MAX_URLS = 50
+CONFIG_WRITE_LOCK = threading.Lock()  # the nightly sort and /__urls both rewrite upstreams.conf
+
+
+def clean_urls(urls):
+    """Validate a URL list from /__urls: base URLs only, no logins, no duplicates."""
+    if not isinstance(urls, list) or not urls:
+        raise ValueError("urls must be a non-empty list")
+    if len(urls) > MAX_URLS:
+        raise ValueError(f"at most {MAX_URLS} URLs")
+    out = []
+    for raw in urls:
+        if not isinstance(raw, str):
+            raise ValueError("every URL must be text")
+        u = urlsplit(raw.strip())
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise ValueError(f"not an http(s) URL: {raw[:80]!r}")
+        if u.username or u.password or "@" in u.netloc:
+            raise ValueError(f"no logins in URLs: {u.hostname}")
+        if u.path not in ("", "/") or u.query or u.fragment:
+            raise ValueError(f"base URL only (scheme://host[:port]): {u.hostname}")
+        try:
+            u.port
+        except ValueError:
+            raise ValueError(f"bad port: {u.hostname}")
+        if any(c.isspace() for c in raw.strip()):
+            raise ValueError(f"spaces in URL: {u.hostname}")
+        url = f"{u.scheme}://{u.netloc}".rstrip("/")
+        if url not in out:
+            out.append(url)
+    return out
+
+
+def write_urls(section, urls):
+    """Replace one section's URL lines in upstreams.conf. URLs that stay keep their line (and
+    note); new ones are added plain. Returns False if the file already had this list."""
+    with CONFIG_WRITE_LOCK:
+        lines = open(CONFIG, encoding="utf-8").read().split("\n")
+        out, cur, old, kept, inserted, found = [], None, [], {}, False, False
+        for raw in lines:  # first pass: the section's current lines, to keep their notes
+            st = raw.strip()
+            if st.startswith("[") and st.endswith("]"):
+                cur = st[1:-1].strip()
+            elif cur == section and st.startswith(("http://", "https://")):
+                kept.setdefault(st.split()[0].rstrip("/"), raw)
+        cur = None
+        for raw in lines:
+            st = raw.strip()
+            if st.startswith("[") and st.endswith("]"):
+                if cur == section and not inserted:
+                    while out and not out[-1].strip():
+                        out.pop()
+                    out.extend(urls + [""])
+                    inserted = True
+                cur = st[1:-1].strip()
+                found = found or cur == section
+                out.append(raw)
+            elif cur == section and st.startswith(("http://", "https://")):
+                u = st.split()[0].rstrip("/")
+                old.append(u)
+                if not inserted:  # the new list goes where the first old URL was
+                    out.extend(kept.get(x, x) for x in urls)
+                    inserted = True
+            else:
+                out.append(raw)
+        if not found:
+            raise ValueError(f"no [{section}] section in the config")
+        if cur == section and not inserted:
+            while out and not out[-1].strip():
+                out.pop()
+            out.extend(urls)
+            out.append("")
+        if list(dict.fromkeys(old)) == urls:
+            return False
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONFIG) or ".", prefix=".upstreams.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(out))
+        os.chmod(tmp, os.stat(CONFIG).st_mode & 0o777)
+        os.replace(tmp, CONFIG)
+        return True
+
+
 def _write_sorted(ranked_by_section, when):
+    with CONFIG_WRITE_LOCK:
+        _write_sorted_unlocked(ranked_by_section, when)
+
+
+def _write_sorted_unlocked(ranked_by_section, when):
     """Rewrite upstreams.conf with the new orders. Keeps the header, port lines, comments and
     commented-out URLs; URLs added while the sort ran are kept after the sorted ones."""
     out, section, urls, trailing, banner_done = [], None, [], [], False
