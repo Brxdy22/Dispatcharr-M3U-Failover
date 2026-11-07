@@ -65,7 +65,19 @@ API_RETRY_DELAY seconds, up to API_RETRIES times: a provider can answer 404 to c
 that come too close together, which would fail a whole account refresh.
 
 GET /__drop_live closes this account's live streams at once, so a client reconnects
-straight after a VPN exit change instead of waiting out its read timeout.
+straight after a VPN exit change instead of waiting out its read timeout. It also ends
+any hold from /__before_move.
+
+GET /__before_move?hold=N closes every stream of this account, VOD included, while the
+old exit still works, so the provider sees the connection end and frees its slot. A
+connection cut by the exit change instead stays counted by the provider, which then
+answers 458 to everything. New requests wait up to N seconds (at most MOVE_HOLD_MAX), so
+a player reconnecting straight away doesn't hit the dead tunnel and trip the breaker.
+
+A connection limit answer (LIMIT_STATUSES) while no stream is open here means the
+provider is still counting a connection that is gone. Once that has lasted
+LIMIT_STUCK_AFTER seconds it is logged as a stuck slot and repeated locally for
+LIMIT_ANSWER_SECONDS at a time, so a player's retries don't keep reaching the provider.
 
 A refused exit can look like a missing title: the provider answers 404 on every URL.
 So when every URL agrees on a 404 for a movie or episode, up to CANARIES titles that
@@ -93,6 +105,7 @@ import os
 import re
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -147,6 +160,11 @@ EXIT_HOOK_URL = os.environ.get("EXIT_HOOK_URL", "http://127.0.0.1:9733/vod-block
 if EXIT_HOOK_URL.lower() in ("", "off", "0", "no"):
     EXIT_HOOK_URL = ""
 REQUEST_DEADLINE = float(os.environ.get("REQUEST_DEADLINE_SECONDS", "9"))  # Dispatcharr waits 10 s
+MOVE_HOLD_MAX = float(os.environ.get("MOVE_HOLD_MAX_SECONDS", "6"))  # must stay below that wait
+LIMIT_STATUSES = {458, 460}
+LIMIT_STUCK_AFTER = float(os.environ.get("LIMIT_STUCK_AFTER_SECONDS", "20"))  # a seek can see one briefly
+LIMIT_ANSWER_SECONDS = float(os.environ.get("LIMIT_ANSWER_SECONDS", "15"))
+LIMIT_FORGET_SECONDS = 120  # refusals further apart are separate events
 RETRY_RESERVE = 1.5  # time kept for the retry on the new exit
 CANARIES = int(os.environ.get("CANARIES", "2"))
 CANARY_TIMEOUT = 3.0
@@ -237,7 +255,55 @@ class Account:
         self.missing = {}      # playback path -> (expires, status, reason): recent agreed 404s, refused feeds
         self.refused_feeds = {}  # live feed -> time it was last refused with a 403
         self.canaries = [tuple(c) for c in CANARY_DATA.get(name, [])][:CANARIES * 2]  # (kind, file) that played
+        self.hold_until = 0.0   # monotonic: new requests wait for the exit change until then
+        self.limit_first = None  # when the current run of connection limit answers began
+        self.limit_last = 0.0
+        self.limit_until = 0.0   # repeat the answer locally until then
+        self.limit_answer = None  # (status, reason)
+        self.limit_logged = False
         self.set_urls(urls)
+
+    def hold(self, seconds):
+        """Keep new requests waiting while the exit moves; 0 ends the wait."""
+        self.hold_until = time.monotonic() + seconds if seconds > 0 else 0.0
+
+    def held(self):
+        """Wait out a hold, re-reading it so a release takes effect at once."""
+        while time.monotonic() < self.hold_until:
+            time.sleep(0.1)
+
+    def note_limit(self, status, reason):
+        """A connection limit answer. With nothing open here, a run of them that lasts is a
+        stuck slot: the provider is counting a connection that no longer exists."""
+        if active_for(self.name):
+            return
+        now = time.time()
+        with self.lock:
+            if self.limit_first is None or now - self.limit_last > LIMIT_FORGET_SECONDS:
+                self.limit_first, self.limit_logged = now, False
+            self.limit_last = now
+            lasted = now - self.limit_first
+            if lasted < LIMIT_STUCK_AFTER:
+                return
+            self.limit_until = now + LIMIT_ANSWER_SECONDS
+            self.limit_answer = (status, reason)
+            announce, self.limit_logged = not self.limit_logged, True
+        if announce:
+            log.warning("[%s] stuck slot: HTTP %s for %s with no stream open here; the provider is "
+                        "still counting an old connection. Answering locally until it lets go",
+                        self.name, status, human_secs(lasted))
+
+    def limit_hit(self):
+        """(status, reason) to repeat locally, or None to ask the provider."""
+        with self.lock:
+            return self.limit_answer if time.time() < self.limit_until else None
+
+    def note_stream_started(self):
+        with self.lock:
+            first, logged = self.limit_first, self.limit_logged
+            self.limit_first, self.limit_until, self.limit_logged = None, 0.0, False
+        if first is not None and logged:
+            log.info("[%s] slot free again after %s", self.name, human_secs(time.time() - first))
 
     def note_played(self, kind, leaf):
         """Remember a movie or episode that played, newest first, to tell a refused exit
@@ -379,6 +445,7 @@ class Account:
                 "paused_seconds": max(0, int(self.paused_until - now)),
                 "next_pause_seconds": int(min(BREAKER_MAX, self.backoff * 2) if self.backoff else BREAKER),
                 "refused_feeds": sorted(f for f, t in self.refused_feeds.items() if now - t < FEED_403_SECONDS),
+                "stuck_slot_seconds": int(now - self.limit_first) if self.limit_logged else 0,
                 "pause_reason": self.pause_reason if self.paused_until > now else None,
                 "upstreams": [host_of(u) for u in self.urls],
                 "active_streams": active_for(self.name),
@@ -396,7 +463,7 @@ class Account:
 _STREAM_PATH = re.compile(r"^/(movie|series|live|timeshift)/[^/]+/[^/]+/(.+?)(?:\?.*)?$", re.I)
 _BARE_STREAM = re.compile(r"^/[^/]+/[^/]+/(\d+(?:\.\w+)?)$")
 ACTIVE = {}
-LIVE_SOCKS = {}  # entry id -> upstream socket of a live stream, for /__drop_live
+STREAM_SOCKS = {}  # entry id -> (upstream socket, client socket), for /__drop_live and /__before_move
 ACTIVE_LOCK = threading.Lock()
 _ids = iter(range(1, 1 << 62))
 
@@ -436,17 +503,33 @@ def active_for(account_name):
     return rows
 
 
-def drop_live(account_name):
-    """Close the upstream side of an account's live streams; each relay then ends normally."""
+def drop_streams(account_name, kinds=None):
+    """Reset an account's streams, of the given kinds or all of them. A plain close only says
+    we stopped sending, and a provider can keep counting the connection, so each upstream
+    socket closes with a hard reset. Shutting the client side too frees a relay blocked on
+    a slow client, because the reset only goes out when the relay closes the socket."""
     with ACTIVE_LOCK:
-        socks = [s for entry_id, s in LIVE_SOCKS.items()
-                 if ACTIVE.get(entry_id, {}).get("account") == account_name]
-    for sock in socks:
+        picked = [entry_id for entry_id in STREAM_SOCKS
+                  if ACTIVE.get(entry_id, {}).get("account") == account_name
+                  and (kinds is None or ACTIVE[entry_id]["type"] in kinds)]
+        for entry_id in picked:
+            ACTIVE[entry_id]["dropped"] = True
+        socks = [STREAM_SOCKS[entry_id] for entry_id in picked]
+    for upstream, client in socks:
         try:
-            sock.shutdown(socket.SHUT_RDWR)
+            upstream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         except OSError:
             pass
+        for sock in (upstream, client):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
     return len(socks)
+
+
+def drop_live(account_name):
+    return drop_streams(account_name, ("live",))
 
 
 def label(target):
@@ -571,10 +654,24 @@ def make_handler(account):
             if self.path.split("?", 1)[0] == "/__vod_check":
                 return self._send_simple(200, json.dumps(self._vod_check("forget=1" in self.path)))
             if self.path == "/__drop_live":
+                account.hold(0)
                 dropped = drop_live(account.name)
                 log.info("[%s] dropped %d live stream(s) on request", account.name, dropped)
                 return self._send_simple(200, json.dumps({"dropped": dropped}))
+            if self.path.split("?", 1)[0] == "/__before_move":
+                asked = parse_qs(urlsplit(self.path).query).get("hold", ["0"])[0]
+                try:
+                    hold = max(0.0, min(float(asked), MOVE_HOLD_MAX))
+                except ValueError:
+                    hold = 0.0
+                account.hold(hold)
+                dropped = drop_streams(account.name)
+                if dropped:
+                    log.info("[%s] closed %d stream(s) before an exit change", account.name, dropped)
+                return self._send_simple(200, json.dumps({"dropped": dropped, "hold_seconds": hold}))
             started = time.monotonic()
+            self.timing = []  # how long each host took to answer, for the log
+            account.held()
             account.learn_creds(self.path)
 
             length = int(self.headers.get("Content-Length") or 0)
@@ -590,6 +687,11 @@ def make_handler(account):
                                                                  "cached": True}))
                 if hit:
                     account.missing.pop(self.path, None)
+            limited = account.limit_hit() if stream_req else None
+            if limited:
+                self.close_connection = True
+                return self._send_simple(limited[0], json.dumps({"error": f"HTTP {limited[0]} {limited[1]}",
+                                                                 "stuck_slot": True}))
 
             wait = account.paused()
             if wait:
@@ -632,12 +734,14 @@ def make_handler(account):
                             conn._create_connection = lambda addr, timeout, src, ip=ip: \
                                 socket.create_connection((ip, addr[1]), timeout, src)
                         try:
+                            asked = time.monotonic()
                             conn.connect()
                             sock = conn.sock  # http.client drops conn.sock once the response will close
                             sock.settimeout(limit(HEADER_TIMEOUT))
                             conn.request(self.command, u.path.rstrip("/") + self.path, body=body,
                                          headers={**headers, "Host": u.netloc})
                             resp = conn.getresponse()
+                            self.timing = [f"{u.hostname} {time.monotonic() - asked:.1f}s"]
                             break
                         except (OSError, http.client.HTTPException, ssl.SSLError) as e:
                             conn.close()
@@ -879,6 +983,7 @@ def make_handler(account):
                 kwargs = {"context": ssl_ctx} if nu.scheme == "https" else {}
                 conn = conn_cls(nu.hostname, nu.port, timeout=CONNECT_TIMEOUT, **kwargs)
                 try:
+                    asked = time.monotonic()
                     conn.connect()
                     sock = conn.sock
                     sock.settimeout(HEADER_TIMEOUT)
@@ -888,6 +993,7 @@ def make_handler(account):
                 except (OSError, http.client.HTTPException, ssl.SSLError) as e:
                     conn.close()
                     raise RedirectFailed(f"{nu.netloc}: {type(e).__name__}: {e}")
+                self.timing.append(f"{nu.hostname} {time.monotonic() - asked:.1f}s")
                 hops.append(nu.netloc)
                 if resp.status in FAILOVER_STATUSES:
                     conn.close()
@@ -898,6 +1004,7 @@ def make_handler(account):
         def _relay(self, resp, conn, sock, via):
             stream = stream_of(self.path) if self.command == "GET" else None
             entry_id, outcome = None, "finished"
+            timing = f" [{', '.join(self.timing)}]"
             if stream and 300 <= resp.status < 400:
                 # Provider hands playback to another host; bytes won't pass through this proxy.
                 loc = urlsplit(resp.getheader("Location") or "")
@@ -907,20 +1014,22 @@ def make_handler(account):
             elif stream and resp.status >= 400:
                 # Account-level refusals (401/404/458/460...) pass straight through; log them so
                 # they're visible here and not only in Dispatcharr's log.
-                log.warning("[%s] x %s %s via %s -> HTTP %s %s", account.name, stream[0], stream[1], via,
-                            resp.status, resp.reason or "")
+                log.warning("[%s] x %s %s via %s -> HTTP %s %s%s", account.name, stream[0], stream[1], via,
+                            resp.status, resp.reason or "", timing)
+                if resp.status in LIMIT_STATUSES:
+                    account.note_limit(resp.status, resp.reason or "")
                 stream = None
             if stream:
+                account.note_stream_started()
                 entry_id = next(_ids)
                 rng = self.headers.get("Range")
                 with ACTIVE_LOCK:
                     ACTIVE[entry_id] = {"account": account.name, "type": stream[0], "stream": stream[1],
                                         "via": via, "range": rng, "client": self.client_address[0],
                                         "started": time.time(), "bytes": 0}
-                    if stream[0] == "live":
-                        LIVE_SOCKS[entry_id] = sock
-                log.info("[%s] > %s %s via %s%s", account.name, stream[0], stream[1], via,
-                         f" ({rng})" if rng else "")
+                    STREAM_SOCKS[entry_id] = (sock, self.connection)
+                log.info("[%s] > %s %s via %s%s%s", account.name, stream[0], stream[1], via,
+                         f" ({rng})" if rng else "", timing)
             try:
                 sock.settimeout(READ_TIMEOUT)
                 self.send_response_only(resp.status, resp.reason)
@@ -961,7 +1070,12 @@ def make_handler(account):
                 if entry_id:
                     with ACTIVE_LOCK:
                         e = ACTIVE.pop(entry_id)
-                        LIVE_SOCKS.pop(entry_id, None)
+                        STREAM_SOCKS.pop(entry_id, None)
+                    if e.get("dropped"):
+                        # A VOD answer has a promised length: the client must see the end here,
+                        # or it waits out its read timeout on a connection kept alive.
+                        outcome = "closed for an exit change"
+                        self.close_connection = True
                     log.info("[%s] # %s %s via %s ended after %s, %s (%s)", account.name, e["type"],
                              e["stream"], e["via"], human_secs(time.time() - e["started"]),
                              human_bytes(e["bytes"]), outcome)

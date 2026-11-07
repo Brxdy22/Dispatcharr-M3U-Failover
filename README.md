@@ -64,6 +64,10 @@ Set these as environment variables. The full list is at the top of `failover.py`
 
 `GET /__drop_live` on an account's port closes its live streams at once, so clients reconnect right after a VPN exit change instead of waiting for a read timeout. Gluetun AutoSwitch calls it after every switch.
 
+`GET /__before_move?hold=N` on an account's port closes all its streams, VOD included, and holds new requests for up to 6 seconds while the exit moves. `/__drop_live` ends the hold early. Gluetun AutoSwitch 1.8.2 calls it just before every switch.
+
+`GET /__status` shows `stuck_slot_seconds` for an account whose provider keeps answering with a connection limit (458 or 460) while nothing is streaming. During that time the proxy answers repeat requests itself, so the provider sees about one try every 15 seconds.
+
 `GET /__vod_check` asks the remembered titles for one byte and answers whether the exit is refused. Gluetun AutoSwitch calls it in the background while nobody is watching. Add `?forget=1` to also forget titles that were refused.
 
 ## Security
