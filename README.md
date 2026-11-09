@@ -22,6 +22,8 @@ Tested on Dispatcharr 0.33.0.
 
 Works with [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin) and [Gluetun AutoSwitch](https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin). All three together cover provider URL failover, account failover for VOD, and VPN exit switching.
 
+See [Dispatcharr Failover Stack](https://github.com/Brxdy22/Dispatcharr-Failover-Stack) to install all three side by side.
+
 ## Install
 
 1. Make a folder for the config, and copy `upstreams.conf.example` into it as `upstreams.conf`. Add your URLs.
