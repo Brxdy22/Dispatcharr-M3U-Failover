@@ -1,13 +1,12 @@
 services:
   m3u-failover:
-    image: python:3.12-alpine
+    image: brxdy22/m3u-failover:1.3   # pin a version; see Releases for the latest
     container_name: m3u-failover
     # Must share a network with Dispatcharr, because the proxy listens on 127.0.0.1.
     # Use "service:gluetun" if Dispatcharr runs through Gluetun, or
     # "container:dispatcharr" if it doesn't.
     network_mode: "service:gluetun"
     restart: unless-stopped
-    command: ["python", "-u", "/app/failover.py"]
     environment:
       - TZ=UTC                   # the nightly sort runs in this time zone
       - CONFIG=/config/upstreams.conf
@@ -15,9 +14,8 @@ services:
       - HEADER_TIMEOUT=15        # seconds to wait for headers before trying the next URL
       - SORT_AT=03:00            # "off" disables the nightly sort
     volumes:
-      - ./failover.py:/app/failover.py:ro
-      - .:/config                # writable: the nightly sort rewrites upstreams.conf
+      - ./config:/config         # holds upstreams.conf; writable, the nightly sort rewrites it
     security_opt:
       - no-new-privileges:true
     read_only: true
-    user: "1000:1000"            # must be able to write to this folder
+    user: "1000:1000"            # must be able to write to the config folder

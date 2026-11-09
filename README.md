@@ -6,6 +6,8 @@ A small proxy that gives a [Dispatcharr](https://github.com/Dispatcharr/Dispatch
 
 Dispatcharr stores one server URL per account. This proxy gives each account a local port and forwards every request to the first working URL on that account's list. It is one Python file with no dependencies.
 
+Docker image: [`brxdy22/m3u-failover`](https://hub.docker.com/r/brxdy22/m3u-failover) (amd64 and arm64).
+
 ## What it does
 
 - **Fails over before playback starts.** Connection errors, timeouts, 403 and 5xx answers move on to the next URL.
@@ -18,13 +20,18 @@ Dispatcharr stores one server URL per account. This proxy gives each account a l
 
 Tested on Dispatcharr 0.33.0.
 
+Works with [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin) and [Gluetun AutoSwitch](https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin). All three together cover provider URL failover, account failover for VOD, and VPN exit switching.
+
 ## Install
 
-1. Copy `failover.py`, `upstreams.conf.example` and `docker-compose.example.yml` into a folder.
-2. Rename `upstreams.conf.example` to `upstreams.conf` and add your URLs.
-3. Add the service from `docker-compose.example.yml` to your Compose file, and set `network_mode` to match your setup.
-4. Start the container.
-5. In Dispatcharr, set each account's Server URL to `http://127.0.0.1:<port>`, using the port from `upstreams.conf`.
+1. Make a folder for the config, and copy `upstreams.conf.example` into it as `upstreams.conf`. Add your URLs.
+2. Add the service from [`docker-compose.example.yml`](docker-compose.example.yml) to your Compose file. Set `network_mode` to match your setup, and the volume to your config folder.
+3. Start the container: `docker compose up -d m3u-failover`.
+4. In Dispatcharr, set each account's Server URL to `http://127.0.0.1:<port>`, using the port from `upstreams.conf`.
+
+The image is pinned by version, for example `brxdy22/m3u-failover:1.3`. To update, change the tag to the [latest release](https://github.com/Brxdy22/Dispatcharr-M3U-Failover/releases/latest) and start the container again.
+
+To run it without the image, mount `failover.py` into `python:3.12-alpine` at `/app/failover.py` and use `command: ["python", "-u", "/app/failover.py"]`.
 
 Usernames and passwords stay in Dispatcharr. The proxy holds them in memory for the nightly sort, and never logs or saves them.
 
@@ -78,6 +85,13 @@ Set these as environment variables. The full list is at the top of `failover.py`
 The proxy has no login of its own, so keep `BIND` on `127.0.0.1` unless you trust everything that can reach it.
 
 Keep `upstreams.conf` out of Git. It is already in `.gitignore`.
+
+## More by Brxdy22
+
+- [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin): Retries a failed VOD stream on the next provider account that carries the title.
+- [Gluetun AutoSwitch](https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin): Moves Gluetun to another VPN exit when streams slow down, VOD is refused or speed tests fail.
+- [Clean Titles](https://github.com/Brxdy22/Dispatcharr-Clean-Titles-Plugin): Renames VOD movies and series to their official TMDB titles and tidies provider categories.
+- [Teamarr Assistant](https://github.com/Brxdy22/Dispatcharr-Teamarr-Assistant-Plugin): Tags regional sports networks with their teams and starts Teamarr generations when new streams appear.
 
 ## Release notes
 
