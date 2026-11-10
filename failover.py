@@ -747,6 +747,7 @@ def make_handler(account):
                 forbidden_hosts = set()
                 api_retries = 0
                 soft_failed = []  # URLs that said 404/511 for this title; rested only if another URL plays it
+                served = False  # a URL handed out a video server for this title: the exit is not refused
                 retry = False
                 targets = account.order()
                 for n, target in enumerate(targets, 1):
@@ -794,6 +795,8 @@ def make_handler(account):
                             # which normally hands out a fresh (often different) server.
                             if e.blocked:  # this mirror can't serve video at all: rest it
                                 account.mark_bad(base, f"redirects to {e}")
+                            else:  # the provider accepted this exit; only its video server let us down
+                                served = True
                             errors.append(f"{via} -> {e}")
                             log.warning("[%s] video server failed for %s %s (%s -> %s)", account.name,
                                         self.command, redact(self.path), via, e)
@@ -841,7 +844,10 @@ def make_handler(account):
                                         label(target), resp.status, stream_req[0], stream_req[1])
                             continue
                         # Every URL asked agrees: the title really isn't there, or the exit is refused.
-                        if (resp.status == 404 and soft_failed and stream_req[0] in VOD_KINDS
+                        if served and resp.status == 404 and soft_failed and stream_req[0] in VOD_KINDS:
+                            log.warning("[%s] %s %s: a URL handed out a video server, so the exit is not "
+                                        "refused; leaving it", account.name, stream_req[0], stream_req[1])
+                        elif (resp.status == 404 and soft_failed and stream_req[0] in VOD_KINDS
                                 and EXIT_HOOK_URL and not exit_checked):
                             exit_checked = True
                             refused, asked = self._exit_refused(stream_req, headers, deadline)
@@ -960,10 +966,14 @@ def make_handler(account):
             plain["Accept-Encoding"] = "identity"  # the catalogue answer is read here, not relayed
             canaries = account.canary_paths(stream_req[1])
             for leaf, path in canaries:
-                answer = self._ask(path, {**plain, "Range": "bytes=0-0"}, deadline)
                 asked.append(leaf)
-                if not answer or canary_verdict(answer[0], answer[1]) != "missing":
-                    return False, asked
+                # Missing only if every URL asked agrees: one mirror can 404 every title on its own.
+                for target in account.order()[:RECHECK_URLS + 1]:
+                    if deadline - time.monotonic() < RETRY_RESERVE + 1:
+                        return False, asked  # no time to prove it: leave the exit alone
+                    answer = self._ask(path, {**plain, "Range": "bytes=0-0"}, deadline, target)
+                    if not answer or canary_verdict(answer[0], answer[1]) != "missing":
+                        return False, asked
             if canaries:
                 return True, asked
             if stream_req[0] != "movie" or not account.creds:

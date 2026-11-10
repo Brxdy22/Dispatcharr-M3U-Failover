@@ -31,7 +31,7 @@ See [Dispatcharr Failover Stack](https://github.com/Brxdy22/Dispatcharr-Failover
 3. Start the container: `docker compose up -d m3u-failover`.
 4. In Dispatcharr, set each account's Server URL to `http://127.0.0.1:<port>`, using the port from `upstreams.conf`.
 
-The image is pinned by version, for example `brxdy22/m3u-failover:1.3`. To update, change the tag to the [latest release](https://github.com/Brxdy22/Dispatcharr-M3U-Failover/releases/latest) and start the container again.
+The image is pinned by version, for example `brxdy22/m3u-failover:1.3.1`. To update, change the tag to the [latest release](https://github.com/Brxdy22/Dispatcharr-M3U-Failover/releases/latest) and start the container again.
 
 To run it without the image, mount `failover.py` into `python:3.12-alpine` at `/app/failover.py` and use `command: ["python", "-u", "/app/failover.py"]`.
 
