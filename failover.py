@@ -94,7 +94,7 @@ streaming (one connection slot) and logs nothing unless the titles are refused.
 ?forget=1 also forgets titles found refused, used after the exit has already moved.
 
 POST /__urls with {"urls": [...]} replaces this account's URL list in upstreams.conf and
-applies it at once (used by the VOD Failover plugin's Mirror URLs section). Only accepted
+applies it at once (used by the Failover Manager plugin's Mirror URLs section). Only accepted
 from loopback; base URLs only (scheme://host[:port]), no logins, paths or queries. Notes
 on URLs that stay are kept; comments and commented-out URLs are left alone.
 

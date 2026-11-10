@@ -16,7 +16,7 @@ Docker image: [`brxdy22/m3u-failover`](https://hub.docker.com/r/brxdy22/m3u-fail
 - **Avoids hammering the provider.** Attempts per request are capped. If everything fails, the account pauses for a while, and the pause doubles if failures continue.
 - **Tells a refused VPN exit from a missing title.** When every URL answers 404 for a movie or episode, it asks a title that played before for one byte. If that is refused too, [Gluetun AutoSwitch](https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin) 1.7 or later moves the exit, and the same request plays on the new exit.
 - **Sorts URLs every night.** The most reliable and fastest URLs move to the top of `upstreams.conf`. URLs are never removed.
-- **Edits from Dispatcharr.** With the [Failover Manager](https://github.com/Brxdy22/Dispatcharr-Failover-Manager-Plugin) plugin (1.5 or later; called Failover Manager before 1.6), you can see and change each account's URLs on the plugin page.
+- **Edits from Dispatcharr.** With the [Failover Manager](https://github.com/Brxdy22/Dispatcharr-Failover-Manager-Plugin) plugin (1.5 or later; called VOD Failover before 1.6), you can see and change each account's URLs on the plugin page.
 
 Tested on Dispatcharr 0.33.0.
 
@@ -31,7 +31,7 @@ See [Dispatcharr Failover Stack](https://github.com/Brxdy22/Dispatcharr-Failover
 3. Start the container: `docker compose up -d m3u-failover`.
 4. In Dispatcharr, set each account's Server URL to `http://127.0.0.1:<port>`, using the port from `upstreams.conf`.
 
-The image is pinned by version, for example `brxdy22/m3u-failover:1.3.1`. To update, change the tag to the [latest release](https://github.com/Brxdy22/Dispatcharr-M3U-Failover/releases/latest) and start the container again.
+The examples use `brxdy22/m3u-failover:latest`. To update, pull the image and start the container again: `docker compose pull m3u-failover && docker compose up -d m3u-failover`. Each [release](https://github.com/Brxdy22/Dispatcharr-M3U-Failover/releases) also has a version tag, for example `brxdy22/m3u-failover:1.3.1.1`, if you prefer to pin one.
 
 To run it without the image, mount `failover.py` into `python:3.12-alpine` at `/app/failover.py` and use `command: ["python", "-u", "/app/failover.py"]`.
 
